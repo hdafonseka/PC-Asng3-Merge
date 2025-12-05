@@ -8,7 +8,7 @@
  *   mpirun -np 4 ./mpi_sort N
  *   Example: mpirun -np 4 ./mpi_sort 10000000
  * 
- * Default N = 10000000 if not provided
+ * Default N = 10000000 
  */
 
 #include <stdio.h>
@@ -16,6 +16,18 @@
 #include <stdint.h>
 #include <string.h>
 #include <mpi.h>
+
+// Portable random number generator (LCG) - same on all systems
+static uint64_t rng_state = 123456;
+
+void seed_rng(uint64_t seed) {
+    rng_state = seed;
+}
+
+int portable_rand() {
+    rng_state = (rng_state * 6364136223846793005ULL + 1442695040888963407ULL);
+    return (int)((rng_state >> 32) & 0x7FFFFFFF);
+}
 
 // Merge two sorted subarrays [left..mid] and [mid+1..right]
 void merge(int *arr, int *tmp, int left, int mid, int right) {
@@ -139,9 +151,9 @@ int main(int argc, char *argv[]) {
         }
         
         // Fill array deterministically
-        srand(123456);
+        seed_rng(123456);
         for (int i = 0; i < N; i++) {
-            arr[i] = rand();
+            arr[i] = portable_rand();
         }
         
         // Prepare scatter parameters

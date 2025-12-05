@@ -1,15 +1,16 @@
 /*
- * CUDA Merge Sort Implementation using Thrust
+ * CUDA Merge Sort Implementation 
+ * GPU Parallel Merge (No CPU Bottleneck)
  * 
  * Compile:
  *   nvcc -O3 -arch=sm_75 -std=c++11 -o cuda_sort cuda.cu
- *   (Replace sm_75 with your GPU compute capability, e.g., sm_60, sm_70, sm_80, sm_86, sm_89)
+ *   (Replace sm_75 with your GPU compute capability)
  * 
  * Run:
- *   ./cuda_sort N
- *   Example: ./cuda_sort 10000000
+ *   ./cuda_sort N THREADS_PER_BLOCK
+ *   Example: ./cuda_sort 10000000 256
  * 
- * Default N = 10000000 if not provided
+ * Default: N=10000000, THREADS_PER_BLOCK=256
  */
 
 #include <stdio.h>
@@ -17,10 +18,19 @@
 #include <stdint.h>
 #include <time.h>
 #include <cuda_runtime.h>
-#include <thrust/sort.h>
-#include <thrust/device_ptr.h>
 
-// CUDA error checking macro
+// Portable random number generator
+static uint64_t rng_state = 123456;
+
+void seed_rng(uint64_t seed) {
+    rng_state = seed;
+}
+
+int portable_rand() {
+    rng_state = (rng_state * 6364136223846793005ULL + 1442695040888963407ULL);
+    return (int)((rng_state >> 32) & 0x7FFFFFFF);
+}
+
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \
@@ -31,20 +41,134 @@
         } \
     } while(0)
 
-// Verify array is sorted and compute checksum
+// GPU kernel: Bitonic sort for chunks within a block
+__global__ void bitonicSortKernel(int *arr, int n, int chunk_size) {
+    extern __shared__ int shared_data[];
+    
+    int chunk_id = blockIdx.x;
+    int start = chunk_id * chunk_size;
+    int tid = threadIdx.x;
+    int actual_size = min(chunk_size, n - start);
+    
+    if (start >= n) return;
+    
+    // Find next power of 2
+    int size_pow2 = 1;
+    while (size_pow2 < actual_size) size_pow2 *= 2;
+    
+    // Load data into shared memory
+    if (tid < actual_size) {
+        shared_data[tid] = arr[start + tid];
+    } else if (tid < size_pow2) {
+        shared_data[tid] = 2147483647; // INT_MAX for padding
+    }
+    __syncthreads();
+    
+    // Bitonic sort
+    for (int k = 2; k <= size_pow2; k *= 2) {
+        for (int j = k / 2; j > 0; j /= 2) {
+            int ixj = tid ^ j;
+            
+            if (ixj > tid && tid < size_pow2 && ixj < size_pow2) {
+                int ascending = ((tid & k) == 0);
+                
+                if ((ascending && shared_data[tid] > shared_data[ixj]) || 
+                    (!ascending && shared_data[tid] < shared_data[ixj])) {
+                    // Swap
+                    int temp = shared_data[tid];
+                    shared_data[tid] = shared_data[ixj];
+                    shared_data[ixj] = temp;
+                }
+            }
+            __syncthreads();
+        }
+    }
+    
+    // Write back only valid elements
+    if (tid < actual_size) {
+        arr[start + tid] = shared_data[tid];
+    }
+}
+
+// GPU kernel: Parallel merge of sorted chunks
+__global__ void parallelMergeKernel(int *src, int *dst, int n, int chunk_size) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (tid >= n) return;
+    
+    // Determine which pair of chunks this thread belongs to
+    int merge_id = tid / (2 * chunk_size);
+    int local_id = tid % (2 * chunk_size);
+    
+    int left_start = merge_id * 2 * chunk_size;
+    int mid = left_start + chunk_size;
+    int right_end = min(left_start + 2 * chunk_size, n);
+    
+    // Boundary check
+    if (left_start >= n) return;
+    mid = min(mid, n);
+    
+    // Binary search to find position in merged array
+    int target_pos = left_start + local_id;
+    if (target_pos >= right_end) return;
+    
+    // Determine which sorted chunk and position
+    int left_size = mid - left_start;
+    int right_size = right_end - mid;
+    
+    // Binary search in left chunk for elements <= target
+    int left_pos = 0;
+    if (local_id < left_size) {
+        // This element is from left chunk
+        int value = src[left_start + local_id];
+        
+        // Count elements in right chunk that are smaller
+        int l = 0, r = right_size;
+        while (l < r) {
+            int m = (l + r) / 2;
+            if (mid + m < n && src[mid + m] < value) {
+                l = m + 1;
+            } else {
+                r = m;
+            }
+        }
+        left_pos = local_id + l;
+        dst[left_start + left_pos] = value;
+    } else if (local_id < left_size + right_size) {
+        // This element is from right chunk
+        int right_idx = local_id - left_size;
+        int value = src[mid + right_idx];
+        
+        // Count elements in left chunk that are <= value
+        int l = 0, r = left_size;
+        while (l < r) {
+            int m = (l + r) / 2;
+            if (left_start + m < n && src[left_start + m] <= value) {
+                l = m + 1;
+            } else {
+                r = m;
+            }
+        }
+        left_pos = l + right_idx;
+        dst[left_start + left_pos] = value;
+    }
+}
+
+// Verify and checksum
 int verify_and_checksum(int *arr, int n, uint64_t *checksum) {
     *checksum = 0;
     for (int i = 0; i < n; i++) {
         *checksum += (uint64_t)arr[i];
         if (i > 0 && arr[i] < arr[i-1]) {
-            return 0; // Not sorted
+            return 0;
         }
     }
-    return 1; // Sorted OK
+    return 1;
 }
 
 int main(int argc, char *argv[]) {
-    int N = 10000000; // Default
+    int N = 10000000;
+    int threads_per_block = 256;
     
     if (argc > 1) {
         N = atoi(argv[1]);
@@ -54,7 +178,25 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    // Allocate host arrays
+    if (argc > 2) {
+        threads_per_block = atoi(argv[2]);
+        if (threads_per_block <= 0 || threads_per_block > 1024) {
+            fprintf(stderr, "Invalid threads_per_block (1-1024): %s\n", argv[2]);
+            return 1;
+        }
+        // Ensure power of 2
+        int pow2 = 1;
+        while (pow2 < threads_per_block) pow2 *= 2;
+        if (pow2 != threads_per_block) {
+            fprintf(stderr, "threads_per_block must be power of 2 (64, 128, 256, 512, 1024)\n");
+            return 1;
+        }
+    }
+    
+    int chunk_size = threads_per_block;
+    int num_blocks = (N + chunk_size - 1) / chunk_size;
+    
+    // Allocate host memory
     int *h_arr = (int*)malloc(N * sizeof(int));
     
     if (!h_arr) {
@@ -62,86 +204,109 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    // Fill array deterministically
-    srand(123456);
+    // Fill array
+    seed_rng(123456);
     for (int i = 0; i < N; i++) {
-        h_arr[i] = rand();
+        h_arr[i] = portable_rand();
     }
     
-    // Allocate device array
-    int *d_arr;
+    // Allocate device memory (need two buffers for ping-pong merging)
+    int *d_arr, *d_temp;
     CUDA_CHECK(cudaMalloc(&d_arr, N * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_temp, N * sizeof(int)));
     
-    // Create CUDA events for timing
-    cudaEvent_t start_copy_h2d, end_copy_h2d;
-    cudaEvent_t start_sort, end_sort;
-    cudaEvent_t start_copy_d2h, end_copy_d2h;
-    
-    CUDA_CHECK(cudaEventCreate(&start_copy_h2d));
-    CUDA_CHECK(cudaEventCreate(&end_copy_h2d));
+    // Events
+    cudaEvent_t start_h2d, end_h2d, start_sort, end_sort, start_merge, end_merge, start_d2h, end_d2h;
+    CUDA_CHECK(cudaEventCreate(&start_h2d));
+    CUDA_CHECK(cudaEventCreate(&end_h2d));
     CUDA_CHECK(cudaEventCreate(&start_sort));
     CUDA_CHECK(cudaEventCreate(&end_sort));
-    CUDA_CHECK(cudaEventCreate(&start_copy_d2h));
-    CUDA_CHECK(cudaEventCreate(&end_copy_d2h));
+    CUDA_CHECK(cudaEventCreate(&start_merge));
+    CUDA_CHECK(cudaEventCreate(&end_merge));
+    CUDA_CHECK(cudaEventCreate(&start_d2h));
+    CUDA_CHECK(cudaEventCreate(&end_d2h));
     
-    // Start total timing
-    struct timespec total_start, total_end;
-    clock_gettime(CLOCK_MONOTONIC, &total_start);
-    
-    // Copy host to device (timed)
-    CUDA_CHECK(cudaEventRecord(start_copy_h2d));
+    // H2D
+    CUDA_CHECK(cudaEventRecord(start_h2d));
     CUDA_CHECK(cudaMemcpy(d_arr, h_arr, N * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaEventRecord(end_copy_h2d));
+    CUDA_CHECK(cudaEventRecord(end_h2d));
     
-    // Sort using Thrust (timed)
+    // Sort phase: Sort chunks on GPU
+    size_t shared_mem_size = threads_per_block * sizeof(int);
     CUDA_CHECK(cudaEventRecord(start_sort));
-    thrust::device_ptr<int> dev_ptr(d_arr);
-    thrust::sort(dev_ptr, dev_ptr + N);
+    bitonicSortKernel<<<num_blocks, threads_per_block, shared_mem_size>>>(d_arr, N, chunk_size);
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(end_sort));
+    CUDA_CHECK(cudaDeviceSynchronize());
     
-    // Copy device to host (timed)
-    CUDA_CHECK(cudaEventRecord(start_copy_d2h));
-    CUDA_CHECK(cudaMemcpy(h_arr, d_arr, N * sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaEventRecord(end_copy_d2h));
+    // Merge phase: Parallel merge on GPU
+    CUDA_CHECK(cudaEventRecord(start_merge));
     
-    // Synchronize to ensure all operations complete
-    CUDA_CHECK(cudaEventSynchronize(end_copy_d2h));
+    int current_chunk = chunk_size;
+    int *src = d_arr;
+    int *dst = d_temp;
     
-    // End total timing
-    clock_gettime(CLOCK_MONOTONIC, &total_end);
+    while (current_chunk < N) {
+        // Calculate threads needed for merge
+        int merge_threads = 256;
+        int merge_blocks = (N + merge_threads - 1) / merge_threads;
+        
+        parallelMergeKernel<<<merge_blocks, merge_threads>>>(src, dst, N, current_chunk);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        // Swap buffers (ping-pong)
+        int *temp = src;
+        src = dst;
+        dst = temp;
+        
+        current_chunk *= 2;
+    }
     
-    // Calculate elapsed times
-    float time_h2d_ms, time_sort_ms, time_d2h_ms;
-    CUDA_CHECK(cudaEventElapsedTime(&time_h2d_ms, start_copy_h2d, end_copy_h2d));
-    CUDA_CHECK(cudaEventElapsedTime(&time_sort_ms, start_sort, end_sort));
-    CUDA_CHECK(cudaEventElapsedTime(&time_d2h_ms, start_copy_d2h, end_copy_d2h));
+    CUDA_CHECK(cudaEventRecord(end_merge));
+    CUDA_CHECK(cudaDeviceSynchronize());
     
-    float gpu_time_ms = time_sort_ms;
-    float total_gpu_time_ms = time_h2d_ms + time_sort_ms + time_d2h_ms;
+    // Final result is in src
+    int *final_arr = src;
     
-    double total_host_time_ms = (total_end.tv_sec - total_start.tv_sec) * 1000.0 +
-                                (total_end.tv_nsec - total_start.tv_nsec) / 1000000.0;
+    // D2H
+    CUDA_CHECK(cudaEventRecord(start_d2h));
+    CUDA_CHECK(cudaMemcpy(h_arr, final_arr, N * sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaEventRecord(end_d2h));
+    CUDA_CHECK(cudaEventSynchronize(end_d2h));
     
-    // Verify and compute checksum
+    // Timing
+    float time_h2d, time_sort, time_merge, time_d2h;
+    CUDA_CHECK(cudaEventElapsedTime(&time_h2d, start_h2d, end_h2d));
+    CUDA_CHECK(cudaEventElapsedTime(&time_sort, start_sort, end_sort));
+    CUDA_CHECK(cudaEventElapsedTime(&time_merge, start_merge, end_merge));
+    CUDA_CHECK(cudaEventElapsedTime(&time_d2h, start_d2h, end_d2h));
+    
+    float gpu_time_ms = time_sort + time_merge;
+    float total_time_ms = time_h2d + time_sort + time_merge + time_d2h;
+    
+    // Verify
     uint64_t checksum;
     int sorted = verify_and_checksum(h_arr, N, &checksum);
     
-    // Print result (showing GPU kernel time as main metric)
-    printf("CUDA N=%d config=gpu_sort time_ms=%.2f total_time_ms=%.2f correctness=%s checksum=%lu\n",
-           N, gpu_time_ms, total_gpu_time_ms, sorted ? "OK" : "FAIL", checksum);
-    
-    // Additional timing breakdown (optional, for debugging)
-    // printf("  H2D: %.2f ms, Sort: %.2f ms, D2H: %.2f ms, Host total: %.2f ms\n",
-    //        time_h2d_ms, time_sort_ms, time_d2h_ms, total_host_time_ms);
+    // Print
+    printf("CUDA N=%d config=threads_%d_blocks_%d time_ms=%.2f total_time_ms=%.2f correctness=%s checksum=%lu\n",
+           N, threads_per_block, num_blocks, gpu_time_ms, total_time_ms, 
+           sorted ? "OK" : "FAIL", checksum);
+    printf("  Breakdown: H2D=%.2fms Sort=%.2fms Merge=%.2fms D2H=%.2fms\n",
+           time_h2d, time_sort, time_merge, time_d2h);
     
     // Cleanup
-    CUDA_CHECK(cudaEventDestroy(start_copy_h2d));
-    CUDA_CHECK(cudaEventDestroy(end_copy_h2d));
+    CUDA_CHECK(cudaEventDestroy(start_h2d));
+    CUDA_CHECK(cudaEventDestroy(end_h2d));
     CUDA_CHECK(cudaEventDestroy(start_sort));
     CUDA_CHECK(cudaEventDestroy(end_sort));
-    CUDA_CHECK(cudaEventDestroy(start_copy_d2h));
-    CUDA_CHECK(cudaEventDestroy(end_copy_d2h));
+    CUDA_CHECK(cudaEventDestroy(start_merge));
+    CUDA_CHECK(cudaEventDestroy(end_merge));
+    CUDA_CHECK(cudaEventDestroy(start_d2h));
+    CUDA_CHECK(cudaEventDestroy(end_d2h));
     CUDA_CHECK(cudaFree(d_arr));
+    CUDA_CHECK(cudaFree(d_temp));
     free(h_arr);
     
     return 0;
